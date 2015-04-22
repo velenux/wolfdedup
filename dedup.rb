@@ -14,7 +14,10 @@ require 'data_mapper'
 # enable for debugging
 $DEBUG = false
 
-DataMapper::Logger.new(STDOUT, :debug) if $DEBUG
+# enable for testing
+$TEST  = false
+
+DataMapper::Logger.new(STDOUT, :debug) if $TEST or $DEBUG
 
 # CONFIG: your database parameters
 DataMapper.setup(:default, 'mysql://username:password@hostname/dbname')
@@ -33,7 +36,7 @@ DataMapper.setup(:default, 'mysql://username:password@hostname/dbname')
 # FileSystemItem
 class FSItem
 	include DataMapper::Resource
-	@@read_chunk_size = 1024 * 256
+	@@read_chunk_size = 1024 * 256  # 256kb
 
 	property :id,     Serial
 	property :inode,  Integer, :min => 0, :max => 281474976710656
@@ -105,7 +108,14 @@ ignored_files = 0
 # CONFIG (FIXME): specify the search paths here
 # (in the future this will be rewritten to read paths from the command line)
 Dir["/files1/**/*", "/files2/**/*", "/files3/**/*"].each do |f|
-	next if (not File.file?(f) or File.symlink?(f))
+
+	# skip directories and other special files
+	next if not File.file?(f)
+
+	# skip symbolic links
+	next if File.symlink?(f)
+
+	# gather file statistics and create the object on database
 	begin
 		stats = File.stat(f)
 		FSItem.create!(
@@ -127,26 +137,39 @@ Dir["/files1/**/*", "/files2/**/*", "/files3/**/*"].each do |f|
 	end
 end
 
+# feedback on how many files have been ignored
 puts "Ignoring #{ignored_files} files (probably broken UTF-8 names)"
 
-items = Set.new
-FSItem.all.each do |item|
-	items << item
+# populate a set with all the FSItems we created, ordered by modification date
+all_items_set = Set.new
+FSItem.all(:order => [ :change.desc ]).each do |fs_item|
+	all_items_set << fs_item
 end
 
 # for each object
-items.each do |item|
-	# find other objects with the same size, but different inode and path
-	same_size = FSItem.all(:size => item.size, :id.not => item.id, :inode.not => item.inode)
-	# check these files against our current object
-	same_size.each do |other|
+all_items_set.each do |item|
+	# iterate over other objects with the same size, but different inode and path
+	# starting from the oldest and compare them  to the current one
+	items_with_same_size = FSItem.all(:size => item.size, :id.not => item.id, :inode.not => item.inode, :order => [ :change.asc ]).each do |other|
+
 		# if objects have identical md5+sha256
 		if item == other
-			puts "#{other.path} => #{item.path}" if $DEBUG
-			# create a hardlink between them. FIXME: gracefully handle failed links
-			FileUtils.ln other.path, item.path, :force => true
-			# remove the other object from the set, so we won't check it again
-			items.delete other
+
+			# output the link that would have been created
+			puts "#{other.path} => #{item.path}" if ($TEST or $DEBUG)
+
+			# create a hardlink between them.
+			if not $TEST
+				begin
+					FileUtils.ln other.path, item.path, :force => true
+				
+				rescue => e
+					errors << "Cannot link #{other.path} to #{item.path}, #{e}"
+				end
+
+				# remove the other object from the set, so we won't check it again
+				all_items_set.delete other
+			end
 		end
 	end
 end
